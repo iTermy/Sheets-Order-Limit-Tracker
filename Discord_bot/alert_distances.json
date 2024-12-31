@@ -1,0 +1,14 @@
+{
+    "forex": 15.0,
+    "gold": 10,
+    "silver": 0.1,
+    "oil": 0.2,
+    "nikkei": 100,
+    "us30": 100,
+    "spx": 10,
+    "nas": 50,
+    "dax": 10,
+    "btc": 300,
+    "eth": 10,
+    "stocks": 5
+}
