@@ -83,7 +83,6 @@ def get_forex_prices(symbol: str) -> list or None:
 
 def is_forex_pair(symbol: str) -> bool:
     """Determine if the symbol is a forex pair."""
-    # List of all currencies (I think)
     currency_codes = {'USD', 'EUR', 'GBP', 'JPY', 'AUD', 'NZD', 'CAD', 'CHF', 'SGD', 'HKD'}
 
     if len(symbol) == 6:
@@ -93,7 +92,7 @@ def is_forex_pair(symbol: str) -> bool:
     return False
 
 
-def calculate_active_limit_distances(order_limits):
+def calculate_active_limit_distances(order_limits: list[list[str]]) -> list[list[str]]:
     """
     Calculate distances for active limits.
 
@@ -112,7 +111,8 @@ def calculate_active_limit_distances(order_limits):
 
     for group in order_limits:
         status = group[-1]
-        if status.lower() not in ["cancelled", "nm", "near miss", "expired"]:
+        status_exempt = ["cancelled", "nm", "near miss", "expired", "hit", "cancel", "tp", "sl", "stop loss"]
+        if status.lower() not in status_exempt:
             unique_symbols.add(group[0])
 
     symbol_prices = {}
@@ -126,7 +126,8 @@ def calculate_active_limit_distances(order_limits):
         limit_price = float(group[3])
         status = group[-1]
 
-        if status.lower() in ["cancelled", "nm", "near miss", "expired"]:
+        status_exempt = ["cancelled", "nm", "near miss", "expired", "hit", "cancel", "tp", "sl", "stop loss"]
+        if status.lower() in status_exempt:
             continue
 
         try:
