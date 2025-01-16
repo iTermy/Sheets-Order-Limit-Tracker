@@ -1,5 +1,6 @@
 import discord
 from discord.ext import tasks, commands
+from discord.ext.commands import BucketType
 import datetime
 from googleapiclient.discovery import build
 from google.oauth2 import service_account
@@ -9,9 +10,10 @@ import json
 import re
 import os
 import sys
+from typing import Dict, List, Tuple
 from googleapiclient.errors import HttpError
 
-# Load credentials from config.json
+# Load credentials
 try:
     with open('config.json', 'r') as f:
         config = json.load(f)
@@ -53,7 +55,7 @@ RANGE_NAMES = [
 # Default alert distances configuration
 DEFAULT_ALERTS = {
     'forex': 10,
-    'gold': 10,
+    'gold': 5,
     'silver': 0.1,
     'oil': 0.2,
     'nikkei': 100,
@@ -63,7 +65,7 @@ DEFAULT_ALERTS = {
     'dax': 10,
     'btc': 750,
     'eth': 20,
-    'stocks': 2
+    'stocks': 3
 }
 
 # Symbol mappings
@@ -77,12 +79,21 @@ SYMBOL_TYPES = {
     'nas': 'USTEC',
     'dax': 'DE40',
     'btc': 'BTCUSD',
+    'eth': 'ETHUSD'
+}
+
+# I have no idea why I can't combine this with the top one. It breaks for some reason.
+SYMBOL_MAPPINGS = {
+    'gold': 'XAUUSD',
+    'dax': 'DE40',
+    'spx': 'US500',
+    'nas': 'USTEC',
+    'btc': 'BTCUSD',
     'eth': 'ETHUSD',
     'gu': 'GBPUSD',
     'uj': 'USDJPY'
 }
 
-# Sheet mappings
 SHEET_NAME_MAPPING = {
     'daily trades': 'Daily Trades',
     'scalps': 'Scalps',
@@ -102,6 +113,8 @@ FOREX_MAJORS = {
     'EURUSD', 'GBPUSD', 'USDJPY', 'USDCHF',
     'AUDUSD', 'USDCAD', 'NZDUSD'
 }
+
+PAGINATION_EMOJI = ['⬅️', '➡️']
 
 
 def add_limit_to_sheet(limit_data: list) -> bool:
@@ -149,14 +162,12 @@ def add_limit_to_sheet(limit_data: list) -> bool:
         # Find first empty row
         empty_row = None
         for i in range(98):
-            row_index = i + 3  # Start from row 3
+            row_index = i + 3
 
-            # If we've reached beyond existing values, this row is empty
             if i >= len(values):
                 empty_row = row_index
                 break
 
-            # If row exists but is empty or has all empty cells
             row = values[i] if i < len(values) else []
             if not row or all(cell == '' for cell in row):
                 empty_row = row_index
@@ -214,7 +225,7 @@ async def update_limit_status(symbol: str, price1: str, new_status: str) -> list
         updated_sheets = []
         checked_sheets = set()
 
-        # First check most likely sheet based on symbol (optimization)
+        # First check most likely sheet based on symbol
         if symbol == 'XAUUSD':
             priority_sheet = 'Gold!B3:K100'
         elif symbol in FOREX_MAJORS:
@@ -357,27 +368,47 @@ def get_mapped_symbol(text: str, available_symbols: set) -> str or None:
     """
     text = text.lower()
 
-    # Check symbol mappings first
+    # First check for exact stock symbols (ending in .NYSE or .NAS)
+    words = text.upper().split()
+    for word in words:
+        if word.endswith(('.NYSE', '.NAS')) and word in available_symbols:
+            return word
+
+    # Then check symbol mappings
     for key, mapped_symbol in SYMBOL_TYPES.items():
         if key in text:
             return mapped_symbol if mapped_symbol in available_symbols else None
 
     # If no mapping found, look for direct symbol match
-    words = text.upper().split()
     for word in words:
         if word in available_symbols:
             return word
 
+    # Finally, check company names and symbols in each word
+    skip_words = {'long', 'short', 'vth', 'hot', 'stops', 'comments'}
+    words = [word.lower() for word in text.split() if word.lower() not in skip_words]
+    words = [word for word in words if not any(c.isdigit() for c in word)]
+
+    for word in words:
+        matches = []
+        for symbol in available_symbols:
+            if symbol.endswith(('.NYSE', '.NAS')):
+                symbol_info = mt5.symbol_info(symbol)
+                if symbol_info and symbol_info.description:
+                    # Check both symbol and description
+                    if (word in symbol_info.description.lower() or
+                            word in symbol.lower()):
+                        matches.append(symbol)
+
+        if len(matches) == 1:
+            return matches[0]
+        elif len(matches) > 1:
+            continue
+
     return None
 
 
-def get_forex_prices(symbol: str) -> list or None:
-    """
-    Get the current bid and ask prices for a symbol.
-
-    Returns:
-    [symbol, bid, ask]
-    """
+def get_bid_price(symbol: str) -> float or None:
     if not mt5.initialize():
         print(f"MT5 failed to initialize, error code = {mt5.last_error()}")
         return None
@@ -387,9 +418,9 @@ def get_forex_prices(symbol: str) -> list or None:
         if symbol_info_tick is None:
             print(f"Failed to get symbol info for {symbol}")
             return None
-        return [symbol, symbol_info_tick.bid, symbol_info_tick.ask]
+        return symbol_info_tick.bid
     except Exception as e:
-        print(f"Error getting prices: {e}")
+        print(f"Error getting price for {symbol}: {e}")
         return None
 
 
@@ -414,57 +445,114 @@ def calculate_active_limit_distances(order_limits: list[list[str]]) -> list[list
             [[symbol, position, sl, price 1, price 2, price 3, price 4, price 5, price 6, status], [symbol...]]
 
     Returns:
-        active_limits_with_distances (List): List of lists containing active limits and their distances to current price
+    active_limits_with_distances (List): List of lists containing active limits and their distances to current price
         Example:
             [[symbol, position, sl, price 1, price 2, status, distance], [symbol, position, sl, price 1, price 2...]]
     """
     active_limits_with_distances = []
-    unique_symbols = set()
-
-    for group in order_limits:
-        status = group[-1]
-        status_exempt = ["cancelled", "nm", "near miss", "expired", "hit", "cancel", "tp", "sl", "stop loss"]
-        if status.lower() not in status_exempt:
-            unique_symbols.add(group[0])
-
     symbol_prices = {}
-    for symbol in unique_symbols:
-        forex_price = get_forex_prices(symbol)
-        if forex_price is not None:
-            symbol_prices[symbol] = forex_price[1]
+    status_exempt = ["cancelled", "nm", "near miss", "expired", "hit", "cancel", "tp", "sl", "stop loss"]
 
     for group in order_limits:
-        symbol = group[0]
-        limit_price = float(group[3])
-        status = group[-1]
+        status = group[-1].lower()
 
-        status_exempt = ["cancelled", "nm", "near miss", "expired", "hit", "cancel", "tp", "sl", "stop loss"]
-        if status.lower() in status_exempt:
+        # Skip if status is exempt
+        if status in status_exempt:
             continue
 
+        symbol = group[0]
         try:
-            if symbol in symbol_prices:
-                current_bid_price = symbol_prices[symbol]
+            # Get current price
+            if symbol not in symbol_prices:
+                current_bid_price = get_bid_price(symbol)
+                if current_bid_price is None:
+                    active_limits_with_distances.append(group + ["ERROR"])
+                    continue
+                symbol_prices[symbol] = current_bid_price
 
-                if is_forex_pair(symbol):
-                    pip_size = 0.01 if "JPY" in symbol else 0.0001
-                    digits = 2 if "JPY" in symbol else 5
-                    distance = round(abs(current_bid_price - limit_price) / pip_size, digits)
-                else:
-                    distance = round(abs(current_bid_price - limit_price), 2)
+            current_bid_price = symbol_prices[symbol]
+            limit_price = float(group[3])  # First limit price
 
-                active_limits_with_distances.append(group + [distance])
+            # Calculate distance based on symbol type
+            if is_forex_pair(symbol):
+                pip_size = 0.01 if "JPY" in symbol else 0.0001
+                digits = 2 if "JPY" in symbol else 5
+                distance = round(abs(current_bid_price - limit_price) / pip_size, digits)
             else:
-                active_limits_with_distances.append(group + ["ERROR"])
+                distance = round(abs(current_bid_price - limit_price), 2)
+
+            active_limits_with_distances.append(group + [distance])
 
         except Exception as e:
+            print(f"Error processing {symbol}: {str(e)}")
             active_limits_with_distances.append(group + ["ERROR"])
 
     return active_limits_with_distances
 
 
+def get_stock_info(symbol: str) -> Tuple[str, str]:
+    """
+    Get stock symbol and name from MT5.
+
+    Args:
+        symbol: The stock symbol
+
+    Returns:
+        Tuple containing (symbol, description or symbol)
+    """
+    try:
+        symbol_info = mt5.symbol_info(symbol)
+        if symbol_info and symbol_info.description:
+            return symbol, symbol_info.description
+        return symbol, symbol
+    except Exception as e:
+        print(f"Error getting stock info for {symbol}: {e}")
+        return symbol, symbol
+
+
+def filter_and_sort_stocks(available_symbols: set, start_letter: str = None) -> List[Tuple[str, str]]:
+    """
+    Filter and sort stocks from available symbols.
+
+    Args:
+        available_symbols: Set of available MT5 symbols
+        start_letter: Optional letter to filter by
+
+    Returns:
+        List of tuples containing (symbol, company_name)
+    """
+    # Filter for NYSE and NASDAQ stocks
+    stocks = [
+        symbol for symbol in available_symbols
+        if symbol.endswith(('.NYSE', '.NAS'))
+    ]
+
+    # Filter by starting letter if provided
+    if start_letter:
+        stocks = [
+            symbol for symbol in stocks
+            if symbol.startswith(start_letter.upper())
+        ]
+
+    # Get stock info and sort
+    stock_info = [get_stock_info(symbol) for symbol in stocks]
+    return sorted(stock_info, key=lambda x: x[0])
+
+
 class InvalidCredentials(Exception):
     pass
+
+
+class LastOperation:
+    def __init__(self, operation_type: str, sheet_name: str, row_index: int,
+                 old_values: list, new_values: list, range_name: str):
+        self.operation_type = operation_type  # handles 'add_limit', 'status_update', 'expiredaily(weekly)'
+        self.sheet_name = sheet_name
+        self.row_index = row_index
+        self.old_values = old_values
+        self.new_values = new_values
+        self.range_name = range_name
+        self.timestamp = datetime.datetime.now(pytz.UTC)
 
 
 class PriceAlertBot(commands.Bot):
@@ -475,6 +563,8 @@ class PriceAlertBot(commands.Bot):
         self.price_alerts_cache = {}
         self.alert_channel = None
         self.alert_distances = self.load_alert_distances()
+        self.alert_cooldown = 24
+        self.last_operation = None
 
         if not mt5.initialize():
             print(f"MT5 initialization failed")
@@ -522,7 +612,7 @@ class PriceAlertBot(commands.Bot):
         current_time = datetime.datetime.now(pytz.UTC)
         self.price_alerts_cache = {
             k: v for k, v in self.price_alerts_cache.items()
-            if current_time - v < datetime.timedelta(hours=24)
+            if current_time - v < datetime.timedelta(hours=self.alert_cooldown)
         }
 
     @tasks.loop(seconds=30)
@@ -581,7 +671,7 @@ class PriceAlertBot(commands.Bot):
                             alert_msg += f"\n{marker} Limit {idx}: {lim_price}"
 
                         alert_msg += f"\nStop Loss: {stop_loss}\n"
-                        alert_msg += f"\n\nFirst limit is {distance} {'pips' if is_forex_pair(symbol) else 'dollars'} away"
+                        alert_msg += f"\nFirst limit is {distance} {'pips' if is_forex_pair(symbol) else 'dollars'} away"
 
                         await self.alert_channel.send(alert_msg)
                         self.price_alerts_cache[limit_id] = current_time
@@ -598,9 +688,11 @@ class PriceAlertBot(commands.Bot):
 class PriceAlertCommands(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
+        self.stock_pages: Dict[int, List[str]] = {}
 
     @commands.command(name='alert')
     async def set_alert_distance(self, ctx, symbol_type: str, distance: float):
+        """Changes how close a limit should be before alerting."""
         symbol_type = symbol_type.lower()
 
         if symbol_type not in DEFAULT_ALERTS:
@@ -620,6 +712,7 @@ class PriceAlertCommands(commands.Cog):
 
     @commands.command(name='config')
     async def show_config(self, ctx):
+        """Shows the current alert configurations. Determines how close a limit should be before alerting."""
         config_msg = "**Current Alert Configurations:**\n"
 
         for symbol_type, distance in self.bot.alert_distances.items():
@@ -650,14 +743,19 @@ class PriceAlertCommands(commands.Cog):
 
     @commands.command(name='prefix')
     async def change_prefix(self, ctx, new_prefix: str):
+        """Change bot prefix"""
         self.bot.command_prefix = new_prefix
         await ctx.send(f"Command prefix changed to: {new_prefix}")
 
     @commands.command(name='closest')
+    @commands.cooldown(1, 2, BucketType.user)
     async def show_closest(self, ctx):
+        """Displays the 10 closest valid limits"""
         try:
+            # Retrieve distances for each limit
             active_limits = calculate_active_limit_distances(self.bot.sheet_data_cache)
 
+            # Sort the valid limits by closest distance (First 10)
             valid_limits = [limit for limit in active_limits if not isinstance(limit[-1], str)]
             sorted_limits = sorted(valid_limits, key=lambda x: x[-1])[:10]
 
@@ -665,6 +763,7 @@ class PriceAlertCommands(commands.Cog):
                 await ctx.send("No active limits found.")
                 return
 
+            # Compose message
             response = "**10 Closest Limits:**\n"
             for limit in sorted_limits:
                 symbol = limit[0]
@@ -677,76 +776,20 @@ class PriceAlertCommands(commands.Cog):
         except Exception as e:
             await ctx.send(f"Error getting closest limits: {e}")
 
-    @commands.command(name='all')
-    async def show_all(self, ctx):
-        """Show all active limits, sorted alphabetically by symbol."""
-        try:
-            active_limits = calculate_active_limit_distances(self.bot.sheet_data_cache)
-
-            # Separate valid and invalid limits
-            valid_limits = []
-            invalid_limits = []
-
-            for limit in active_limits:
-                if isinstance(limit[-1], str):  # Invalid limits have string distance ("ERROR")
-                    invalid_limits.append(limit)
-                else:
-                    valid_limits.append(limit)
-
-            # Sort valid limits by symbol
-            sorted_limits = sorted(valid_limits, key=lambda x: x[0])  # x[0] is the symbol
-
-            if not sorted_limits and not invalid_limits:
-                await ctx.send("No active limits found.")
-                return
-
-            response = "**All Active Limits:**\n"
-
-            # Add valid limits
-            for limit in sorted_limits:
-                symbol = limit[0]
-                limit_price = limit[3]  # First limit price
-                distance = limit[-1]
-                response += f"{symbol} at {limit_price} - {distance} {'pips' if is_forex_pair(symbol) else 'dollars'} away\n"
-
-            # Add invalid limits if any exist
-            if invalid_limits:
-                response += "\n**Limits with Errors:**\n"
-                for limit in invalid_limits:
-                    symbol = limit[0]
-                    limit_price = limit[3]
-                    response += f"{symbol} at {limit_price} - Error getting distance\n"
-
-            # Split response if it exceeds Discord's message length limit
-            if len(response) > 2000:
-                response_parts = []
-                current_part = ""
-
-                for line in response.split('\n'):
-                    if len(current_part) + len(line) + 1 > 2000:
-                        response_parts.append(current_part)
-                        current_part = line + '\n'
-                    else:
-                        current_part += line + '\n'
-
-                if current_part:
-                    response_parts.append(current_part)
-
-                for part in response_parts:
-                    await ctx.send(part)
-            else:
-                await ctx.send(response)
-
-        except Exception as e:
-            await ctx.send(f"Error getting limits: {e}")
-            print(f"Error in show_all command: {str(e)}")
-
-
     @commands.command(name='add')
+    @commands.cooldown(1, 5, BucketType.user)
     async def add_limit(self, ctx, *, limit_string: str):
-        """Add a new trading limit to the sheet."""
+        """
+        Add a group of order limits to the sheet.
+
+        Args: limit_string (str): A string containing the symbol, position, limits (max 6), stop loss, sheet (opt.),
+        comments (opt.) Example: $add 1.00724---1.00561 eurusd long Stops 1.00319 scalps Comments: VTH
+
+        Returns:
+            None
+        """
         try:
-            # Check for keys.json first
+            # Check for keys.json
             if not os.path.exists('keys.json'):
                 await ctx.send("To use this feature, you must have a keys.json file. None was found.")
                 return
@@ -776,7 +819,7 @@ class PriceAlertCommands(commands.Cog):
                 await ctx.send("Error: No numbers found in string")
                 return
 
-            # Convert large numbers if needed (handle indices and crypto)
+            # Convert large numbers if needed (Ex: AUDUSD is sometimes written as 61234 instead of 0.61234)
             if float(numbers[1]) > 30000 and symbol not in ["US30", "JP225", "BTCUSD", "USTEC"]:
                 numbers = [str(float(num) / 100000) for num in numbers]
 
@@ -808,14 +851,14 @@ class PriceAlertCommands(commands.Cog):
 
             # Prepare data for sheet
             limit_data = [
-                sheet_name,  # Sheet name
-                current_date,  # Date
-                symbol,  # Symbol
-                position,  # Long/Short
-                stop_loss,  # Stop Loss
+                sheet_name,
+                current_date,
+                symbol,
+                position,
+                stop_loss,
                 *limits,  # All 6 limits (some may be empty strings)
                 '',  # Status (always blank)
-                comments  # Comments
+                comments
             ]
 
             print(f"Adding limit to {sheet_name} sheet:", limit_data)
@@ -830,15 +873,91 @@ class PriceAlertCommands(commands.Cog):
             await ctx.send(f"Error processing command: {str(e)}")
             print(f"Error in add_limit command: {str(e)}")
 
-    @commands.command(name='status')
-    async def update_status(self, ctx, symbol: str, price1: str, status: str):
-        """Update the status of a limit identified by symbol and stop loss."""
+
+    @commands.command(name='all')
+    @commands.cooldown(1, 2, BucketType.user)
+    async def show_all(self, ctx):
+        """Show all active limits, sorted alphabetically by symbol, then by ascending price."""
         try:
+            active_limits = calculate_active_limit_distances(self.bot.sheet_data_cache)
+
+            valid_limits = []
+            invalid_limits = []
+
+            for limit in active_limits:
+                if isinstance(limit[-1], str):  # Invalid limits have string distance ("ERROR")
+                    invalid_limits.append(limit)
+                else:
+                    valid_limits.append(limit)
+
+            # Sort valid limits by symbol then by first limit price
+            sorted_limits = sorted(valid_limits, key=lambda x: (x[0], float(x[3])))
+
+            if not sorted_limits and not invalid_limits:
+                await ctx.send("No active limits found.")
+                return
+
+            response = "**All Active Limits:**\n"
+
+            # Add valid limits
+            for limit in sorted_limits:
+                symbol = limit[0]
+                limit_price = limit[3]
+                distance = limit[-1]
+                response += f"{symbol} at {limit_price} - {distance} {'pips' if is_forex_pair(symbol) else 'dollars'} away\n"
+
+            # Add invalid limits if any exist
+            if invalid_limits:
+                response += "\n**Limits with Errors:**\n"
+                for limit in invalid_limits:
+                    symbol = limit[0]
+                    limit_price = limit[3]
+                    response += f"{symbol} at {limit_price} - Error getting distance\n"
+
+            # Handling long messages
+            if len(response) > 2000:
+                response_parts = []
+                current_part = ""
+
+                for line in response.split('\n'):
+                    if len(current_part) + len(line) + 1 > 2000:
+                        response_parts.append(current_part)
+                        current_part = line + '\n'
+                    else:
+                        current_part += line + '\n'
+
+                if current_part:
+                    response_parts.append(current_part)
+
+                for part in response_parts:
+                    await ctx.send(part)
+            else:
+                await ctx.send(response)
+
+        except Exception as e:
+            await ctx.send(f"Error getting limits: {e}")
+            print(f"Most likely error in calculate_active_limit_distances. Error: {str(e)}")
+
+    @commands.command(name='status')
+    @commands.cooldown(1, 5, BucketType.user)
+    async def update_status(self, ctx, *args):
+        """Update the status of a limit identified by symbol and first limit price."""
+        try:
+            # Check if we have exactly 3 arguments
+            if len(args) != 3:
+                await ctx.send(
+                    "Error: Command requires exactly 3 parts: symbol, 1st limit price, and status\n"
+                    "Example: $status EURUSD 1.0500 hit")
+                return
+
+            symbol, price1, status = args
+
+            symbol = symbol.upper()
+
             if not os.path.exists('keys.json'):
                 await ctx.send("To use this feature, you must have a keys.json file. None was found.")
                 return
 
-            # Validate status is one word
             if len(status.split()) > 1:
                 await ctx.send("Error: Status must be a single word")
                 return
@@ -847,14 +966,272 @@ class PriceAlertCommands(commands.Cog):
             updated_sheets = await update_limit_status(symbol, price1, status)
 
             if updated_sheets:
-                sheets_str = ", ".join(updated_sheets)
-                await ctx.send(f"Successfully updated status to '{status}' in sheet(s): {sheets_str}")
+                await ctx.send(f"Successfully updated status of {symbol} {price1} to {status}")
             else:
-                await ctx.send(f"No limits found matching {symbol} with stop loss {price1}")
+                await ctx.send(f"No limits found matching {symbol} with first limit price {price1}")
 
         except Exception as e:
             await ctx.send(f"Error updating status: {str(e)}")
             print(f"Error in status command: {str(e)}")
+
+    @commands.command(name='stocklist')
+    async def stock_list(self, ctx, *, query: str = None):
+        """
+        Show available stocks, optionally filtered by starting letter or company name.
+
+        Args:
+            query: Optional filter - either a single letter for listing or company name to search
+        """
+        try:
+            if not query:
+                # Show all stocks if no query provided
+                stocks = filter_and_sort_stocks(self.bot.available_symbols)
+            elif len(query) == 1 and query.isalpha():
+                # Existing behavior for single letter
+                stocks = filter_and_sort_stocks(self.bot.available_symbols, query)
+            else:
+                # Search for specific company
+                query = query.lower()
+                matches = []
+
+                for symbol in self.bot.available_symbols:
+                    if symbol.endswith(('.NYSE', '.NAS')):
+                        symbol_info = mt5.symbol_info(symbol)
+                        if symbol_info and symbol_info.description:
+                            if query in symbol_info.description.lower() or query in symbol.lower():
+                                matches.append((symbol, symbol_info.description))
+
+                if matches:
+                    if len(matches) == 1:
+                        # Single match found
+                        symbol, name = matches[0]
+                        await ctx.send(f"Found match: `{symbol}` - {name}")
+                        return
+                    else:
+                        # Multiple matches found
+                        stocks = sorted(matches, key=lambda x: x[0])
+                else:
+                    await ctx.send(f"No stocks found matching '{query}'.")
+                    return
+
+            if not stocks:
+                filter_msg = f" starting with '{query}'" if len(query) == 1 else ""
+                await ctx.send(f"No stocks found{filter_msg}.")
+                return
+
+            # Paginate results
+            pages = []
+            for i in range(0, len(stocks), 20):
+                page_stocks = stocks[i:i + 20]
+                page = "**Available Stocks:**\n\n"
+                for symbol, name in page_stocks:
+                    page += f"`{symbol}` - {name}\n"
+                page += f"\nPage {len(pages) + 1} of {(len(stocks) + 19) // 20}"
+                pages.append(page)
+
+            # Store pages for this message
+            message = await ctx.send(pages[0])
+            self.stock_pages[message.id] = pages
+
+            # Add navigation reactions
+            if len(pages) > 1:
+                for emoji in PAGINATION_EMOJI:
+                    await message.add_reaction(emoji)
+
+        except Exception as e:
+            await ctx.send(f"Error listing stocks: {str(e)}")
+            print(f"Error in stock_list command: {str(e)}")
+
+    @commands.Cog.listener()
+    async def on_reaction_add(self, reaction, user):
+        """Handle pagination reactions for $stocklist."""
+        if user.bot or str(reaction.emoji) not in PAGINATION_EMOJI:
+            return
+
+        message = reaction.message
+        if message.id not in self.stock_pages:
+            return
+
+        pages = self.stock_pages[message.id]
+        current_page = int(message.content.split('\n')[-1].split('Page')[-1].split('of')[0].strip())
+        total_pages = len(pages)
+
+        # Calculate new page
+        if str(reaction.emoji) == '➡️':
+            new_page = 0 if current_page == total_pages else current_page
+        else:  # Left arrow
+            new_page = total_pages - 1 if current_page == 1 else current_page - 2
+
+        try:
+            await message.edit(content=pages[new_page])
+        except Exception as e:
+            print(f"Error updating page: {e}")
+            print(f"Current page: {current_page}, New page: {new_page}, Total pages: {total_pages}")
+
+        await reaction.remove(user)
+
+    @commands.Cog.listener()
+    async def on_message_delete(self, message):
+        """Clean up stored pages when message is deleted."""
+        if message.id in self.stock_pages:
+            del self.stock_pages[message.id]
+
+    @commands.command(name='setalertcooldown')
+    @commands.cooldown(1, 2, BucketType.user)
+    async def set_alert_cooldown(self, ctx, hours: float):
+        """Set the cooldown period for price alerts."""
+        try:
+            if hours <= 0:
+                await ctx.send("Error: Cooldown must be greater than 0 hours")
+                return
+
+            self.bot.alert_cooldown = hours
+            await ctx.send(f"Alert cooldown period set to {hours} hours")
+
+        except ValueError:
+            await ctx.send("Error: Please provide a valid number of hours")
+        except Exception as e:
+            await ctx.send(f"Error setting alert cooldown: {str(e)}")
+
+    @commands.command(name='clearalertcooldown')
+    @commands.cooldown(1, 2, BucketType.user)
+    async def clear_alert_cooldown(self, ctx):
+        """Clear all alert cooldowns."""
+        try:
+            self.bot.price_alerts_cache.clear()
+            await ctx.send("All alert cooldowns have been cleared")
+
+        except Exception as e:
+            await ctx.send(f"Error clearing alert cooldowns: {str(e)}")
+
+    @commands.command(name='expiredaily')
+    @commands.cooldown(1, 10, BucketType.user)
+    async def expire_daily(self, ctx):
+        """Mark trades in daily-related sheets as expired unless VTH."""
+        try:
+            if not os.path.exists('keys.json'):
+                await ctx.send("To use this feature, you must have a keys.json file. None was found.")
+                return
+
+            credentials = service_account.Credentials.from_service_account_file(
+                'keys.json',
+                scopes=['https://www.googleapis.com/auth/spreadsheets']
+            )
+            service = build('sheets', 'v4', credentials=credentials)
+
+            daily_sheets = ['Daily Trades', 'Scalps', 'OT', 'Indices']
+            total_updates = 0
+
+            for sheet_name in daily_sheets:
+                range_name = f'{sheet_name}!B3:L100'
+
+                result = service.spreadsheets().values().get(
+                    spreadsheetId=SPREADSHEET_ID,
+                    range=range_name
+                ).execute()
+
+                values = result.get('values', [])
+                updates_needed = []
+
+                for row_idx, row in enumerate(values):
+                    # Pad the row with empty strings if it's shorter than 11 columns
+                    padded_row = row + [''] * (11 - len(row)) if len(row) < 11 else row
+                    status = padded_row[9].strip()
+                    comments = padded_row[10].lower()
+
+                    # Update if: status is empty AND comments don't contain 'vth'
+                    if not status and 'vth' not in comments:
+                        update_range = f'{sheet_name}!K{row_idx + 3}'
+                        updates_needed.append({
+                            'range': update_range,
+                            'values': [['expired']]
+                        })
+
+                # Perform batch update if any updates needed
+                if updates_needed:
+                    body = {
+                        'valueInputOption': 'RAW',
+                        'data': updates_needed
+                    }
+                    service.spreadsheets().values().batchUpdate(
+                        spreadsheetId=SPREADSHEET_ID,
+                        body=body
+                    ).execute()
+                    total_updates += len(updates_needed)
+
+            await ctx.send(f"Operation complete: {total_updates} trades marked as expired across daily-related sheets.")
+
+        except Exception as e:
+            await ctx.send(f"Error updating status: {str(e)}")
+            print(f"Error in expire_daily command: {str(e)}")
+
+    @commands.command(name='expireweekly')
+    @commands.cooldown(1, 10, BucketType.user)
+    async def expire_weekly(self, ctx):
+        """Mark trades in all sheets (except Stocks) as expired."""
+        try:
+            if not os.path.exists('keys.json'):
+                await ctx.send("To use this feature, you must have a keys.json file. None was found.")
+                return
+
+            credentials = service_account.Credentials.from_service_account_file(
+                'keys.json',
+                scopes=['https://www.googleapis.com/auth/spreadsheets']
+            )
+            service = build('sheets', 'v4', credentials=credentials)
+
+            # All sheets except Stocks
+            sheets = [name.split('!')[0] for name in RANGE_NAMES if not name.startswith('Stocks!')]
+            total_updates = 0
+
+            for sheet_name in sheets:
+                range_name = f'{sheet_name}!B3:L100'
+
+                result = service.spreadsheets().values().get(
+                    spreadsheetId=SPREADSHEET_ID,
+                    range=range_name
+                ).execute()
+
+                values = result.get('values', [])
+                updates_needed = []
+
+                for row_idx, row in enumerate(values):
+                    # Pad the row with empty strings if it's shorter than 11 columns
+                    padded_row = row + [''] * (11 - len(row)) if len(row) < 11 else row
+                    status = padded_row[9].strip()
+                    comments = padded_row[10].lower()
+
+                    # Update if: status is empty AND comments don't contain 'alien' or 'maso'
+                    if not status and not any(word in comments for word in ['alien', 'maso']):
+                        update_range = f'{sheet_name}!K{row_idx + 3}'
+                        updates_needed.append({
+                            'range': update_range,
+                            'values': [['expired']]
+                        })
+
+                # Perform batch update if any updates needed
+                if updates_needed:
+                    body = {
+                        'valueInputOption': 'RAW',
+                        'data': updates_needed
+                    }
+                    service.spreadsheets().values().batchUpdate(
+                        spreadsheetId=SPREADSHEET_ID,
+                        body=body
+                    ).execute()
+                    total_updates += len(updates_needed)
+
+            await ctx.send(f"Operation complete: {total_updates} trades marked as expired across all non-stock sheets.")
+
+        except Exception as e:
+            await ctx.send(f"Error updating status: {str(e)}")
+            print(f"Error in expire_weekly command: {str(e)}")
+
+    # Cooldown error handling
+    @commands.Cog.listener()
+    async def on_command_error(self, ctx, error):
+        if isinstance(error, commands.CommandOnCooldown):
+            await ctx.send(f"Please wait {round(error.retry_after, 1)} seconds before using this command again.")
 
 
 def main():
