@@ -375,7 +375,7 @@ def get_mapped_symbol(text: str, available_symbols: set) -> str or None:
             return word
 
     # Then check symbol mappings
-    for key, mapped_symbol in SYMBOL_TYPES.items():
+    for key, mapped_symbol in SYMBOL_MAPPINGS.items():
         if key in text:
             return mapped_symbol if mapped_symbol in available_symbols else None
 
